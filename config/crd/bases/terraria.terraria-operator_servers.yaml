@@ -34,6 +34,8 @@ spec:
           spec:
             description: ServerSpec defines the desired state of Server
             properties:
+              port:
+                type: integer
               size:
                 type: integer
               version:
@@ -43,6 +45,7 @@ spec:
               world:
                 type: string
             required:
+            - port
             - size
             - version
             - world

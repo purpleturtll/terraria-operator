@@ -32,6 +32,7 @@ type ServerSpec struct {
 	Version string `json:"version"`
 	World   string `json:"world"`
 	Size    int    `json:"size"`
+	Port    int    `json:"port"`
 }
 
 // ServerStatus defines the observed state of Server
