@@ -7,9 +7,9 @@ metadata:
     app.kubernetes.io/part-of: terraria-operator
     app.kubernetes.io/managed-by: kustomize
     app.kubernetes.io/created-by: terraria-operator
-  name: server-sample
+  name: server-sample-2
 spec:
   version: "1449"
-  world: "test"
+  world: "moj swiat"
   size: 1
-  port: 9000
+  port: 9112

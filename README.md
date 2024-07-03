@@ -89,3 +89,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
+## Command for installing ingress-nginx
+
+```sh
+helm upgrade --install ingress-nginx ingress-nginx \
+              --repo https://kubernetes.github.io/ingress-nginx \
+              --namespace ingress-nginx --create-namespace \
+              --set controller.extraArgs.tcp-services-configmap=ingress-n
+ginx/tcp-services
+```

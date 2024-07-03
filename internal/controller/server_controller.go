@@ -18,18 +18,14 @@ package controller
 
 import (
 	"context"
-	"fmt"
 	"slices"
 	"strconv"
-	"time"
 
-	v1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -60,8 +56,7 @@ func (r *ServerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	// Fetch the Server instance
 	server := &terrariav1.Server{}
-	err := r.Get(ctx, req.NamespacedName, server)
-	if err != nil {
+	if err := r.Get(ctx, req.NamespacedName, server); err != nil {
 		if errors.IsNotFound(err) {
 			// Server resource not found. Ignoring since object must be deleted
 			return ctrl.Result{}, nil
@@ -70,159 +65,289 @@ func (r *ServerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, err
 	}
 
-	// Check if the Pod already exists, if not create a new one
-	pod := &corev1.Pod{}
-	err = r.Get(ctx, client.ObjectKey{Namespace: server.Namespace, Name: server.Name}, pod)
-	if err != nil && errors.IsNotFound(err) {
-		// Define a new Pod
-		pod := newPodForCR(server)
-		log.Info("Creating a new Pod", "Pod.Namespace", pod.Namespace, "Pod.Name", pod.Name)
-		if err := r.Create(ctx, pod); err != nil {
-			log.Error(err, "Failed to create new Pod", "Pod.Namespace", pod.Namespace, "Pod.Name", pod.Name)
-			return ctrl.Result{Requeue: true}, err
-		}
-	} else if err != nil {
-		log.Error(err, "Failed to get Pod")
-		return ctrl.Result{}, err
-	}
+	// Determine if we are adding or removing resources
+	isDeletion := !server.ObjectMeta.DeletionTimestamp.IsZero()
+	isFinalizerPresent := slices.Contains(server.GetFinalizers(), serverFinalizer)
 
-	// Check if the Service already exists, if not create a new one
-	service := &corev1.Service{}
-	err = r.Get(ctx, client.ObjectKey{Namespace: server.Namespace, Name: server.Name}, service)
-	if err != nil && errors.IsNotFound(err) {
-		// Define a new Service
-		service := newServiceForCR(server)
-		log.Info("Creating a new Service", "Service.Namespace", service.Namespace, "Service.Name", service.Name)
-		if err := r.Create(ctx, service); err != nil {
-			log.Error(err, "Failed to create new Service", "Service.Namespace", service.Namespace, "Service.Name", service.Name)
-			return ctrl.Result{Requeue: true}, err
-		}
-	} else if err != nil {
-		log.Error(err, "Failed to get Service")
-		return ctrl.Result{}, err
-	}
+	if isDeletion {
+		if isFinalizerPresent {
+			// Perform cleanup for LoadBalancer and port assignments
+			if err := updateLoadBalancerService(ctx, r, server, false); err != nil {
+				log.Error(err, "Failed to update LoadBalancer service for deletion")
+				return ctrl.Result{Requeue: true}, err
+			}
+			if err := managePortAssignments(ctx, r, server, false); err != nil {
+				log.Error(err, "Failed to manage port assignments for deletion")
+				return ctrl.Result{Requeue: true}, err
+			}
 
-	// Check if the Ingress already exists, if not create a new one
-	ingress := &networkingv1.Ingress{}
-	err = r.Get(ctx, client.ObjectKey{Namespace: server.Namespace, Name: server.Name}, ingress)
-	if err != nil && errors.IsNotFound(err) {
-		// Define a new Ingress
-		ingress := newIngressForCR(server)
-		log.Info("Creating a new Ingress", "Ingress.Namespace", ingress.Namespace, "Ingress.Name", ingress.Name)
-		if err := r.Create(ctx, ingress); err != nil {
-			log.Error(err, "Failed to create new Ingress", "Ingress.Namespace", ingress.Namespace, "Ingress.Name", ingress.Name)
-			return ctrl.Result{Requeue: true}, err
-		}
-	} else if err != nil {
-		log.Error(err, "Failed to get Ingress")
-		return ctrl.Result{}, err
-	}
+			// Continue with deletion logic for dependent resources
+			if err := deleteResources(ctx, r, server); err != nil {
+				log.Error(err, "Failed to delete resources")
+				return ctrl.Result{Requeue: true}, err
+			}
 
-	// If the server object is not being deleted and does not have a finalizer then add one
-	if server.ObjectMeta.DeletionTimestamp.IsZero() {
-		if !slices.Contains(server.GetFinalizers(), serverFinalizer) {
+			// Remove the finalizer
+			controllerutil.RemoveFinalizer(server, serverFinalizer)
+			if err := r.Update(ctx, server); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+	} else {
+		// Add finalizer for new or updated Server resources
+		if !isFinalizerPresent {
 			controllerutil.AddFinalizer(server, serverFinalizer)
 			if err := r.Update(ctx, server); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
 
-		// Update nginx configuration and restart nginx
-		if err := updateNginxConfigMapAndService(ctx, r, server, true); err != nil {
-			log.Error(err, "Failed to update Nginx ConfigMap and Service")
+		// Handle creation and updates for dependent resources
+		if err := reconcileResources(ctx, r, server); err != nil {
+			log.Error(err, "Failed to reconcile resources")
 			return ctrl.Result{Requeue: true}, err
 		}
-		if err := restartNginx(ctx, r); err != nil {
-			log.Error(err, "Failed to restart Nginx")
-			return ctrl.Result{Requeue: true}, err
-		}
-	}
 
-	// Handle cleanup when the server object is being deleted
-	if !server.ObjectMeta.DeletionTimestamp.IsZero() {
-		if slices.Contains(server.GetFinalizers(), serverFinalizer) {
-			if err := updateNginxConfigMapAndService(ctx, r, server, false); err != nil {
-				log.Error(err, "Failed to remove port from Nginx ConfigMap and Service")
-				return ctrl.Result{Requeue: true}, err
-			}
-			if err := restartNginx(ctx, r); err != nil {
-				log.Error(err, "Failed to restart Nginx after cleanup")
-				return ctrl.Result{Requeue: true}, err
-			}
-			controllerutil.RemoveFinalizer(server, serverFinalizer)
-			if err := r.Update(ctx, server); err != nil {
-				return ctrl.Result{}, err
-			}
+		// Update LoadBalancer service and manage port assignments
+		if err := updateLoadBalancerService(ctx, r, server, true); err != nil {
+			log.Error(err, "Failed to update LoadBalancer service")
+			return ctrl.Result{Requeue: true}, err
 		}
-		// Deletion of pod, service, ingress not shown here to avoid redundancy; should be done as needed
+		if err := managePortAssignments(ctx, r, server, true); err != nil {
+			log.Error(err, "Failed to manage port assignments")
+			return ctrl.Result{Requeue: true}, err
+		}
 	}
 
 	// No requeue needed, Kubernetes will call Reconcile when changes occur to the resources watched
 	return ctrl.Result{}, nil
 }
 
-// restartNginx updates an annotation on the Nginx deployment to trigger a pod restart.
-func restartNginx(ctx context.Context, r *ServerReconciler) error {
-	nginxDeploymentName := "nginx" // Name of the Nginx deployment
-	nginxNamespace := "default"    // Namespace where the Nginx is deployed
+func reconcileResources(ctx context.Context, r *ServerReconciler, server *terrariav1.Server) error {
+	log := log.FromContext(ctx)
 
-	// Patch to update the 'kubectl.kubernetes.io/restartedAt' annotation to current time
-	patch := client.RawPatch(types.StrategicMergePatchType, []byte(`{
-        "spec": {
-            "template": {
-                "metadata": {
-                    "annotations": {
-                        "kubectl.kubernetes.io/restartedAt": "`+time.Now().Format(time.RFC3339)+`"
-                    }
-                }
-            }
-        }
-    }`))
+	// Reconcile Pod
+	pod := &corev1.Pod{}
+	podName := client.ObjectKey{Namespace: server.Namespace, Name: server.Name}
+	if err := r.Get(ctx, podName, pod); err != nil {
+		if errors.IsNotFound(err) {
+			pod = newPodForCR(server)
+			if err = r.Create(ctx, pod); err != nil {
+				log.Error(err, "Failed to create Pod", "Pod.Namespace", pod.Namespace, "Pod.Name", pod.Name)
+				return err
+			}
+		} else {
+			return err
+		}
+	}
 
-	// Create a namespaced name for the Nginx deployment
-	depKey := client.ObjectKey{Name: nginxDeploymentName, Namespace: nginxNamespace}
+	// Reconcile Service
+	service := &corev1.Service{}
+	serviceName := client.ObjectKey{Namespace: server.Namespace, Name: server.Name}
+	if err := r.Get(ctx, serviceName, service); err != nil {
+		if errors.IsNotFound(err) {
+			service = newServiceForCR(server)
+			if err = r.Create(ctx, service); err != nil {
+				log.Error(err, "Failed to create Service", "Service.Namespace", service.Namespace, "Service.Name", service.Name)
+				return err
+			}
+		} else {
+			return err
+		}
+	}
 
-	// Fetch the current deployment
-	deployment := &v1.Deployment{}
-	if err := r.Get(ctx, depKey, deployment); err != nil {
+	// Reconcile Ingress
+	ingress := &networkingv1.Ingress{}
+	ingressName := client.ObjectKey{Namespace: server.Namespace, Name: server.Name}
+	if err := r.Get(ctx, ingressName, ingress); err != nil {
+		if errors.IsNotFound(err) {
+			ingress = newIngressForCR(server)
+			if err = r.Create(ctx, ingress); err != nil {
+				log.Error(err, "Failed to create Ingress", "Ingress.Namespace", ingress.Namespace, "Ingress.Name", ingress.Name)
+				return err
+			}
+		} else {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func deleteResources(ctx context.Context, r *ServerReconciler, server *terrariav1.Server) error {
+	log := log.FromContext(ctx)
+
+	// Delete Pod
+	pod := &corev1.Pod{}
+	podName := client.ObjectKey{Namespace: server.Namespace, Name: server.Name}
+	if err := r.Get(ctx, podName, pod); err == nil {
+		if err = r.Delete(ctx, pod); err != nil {
+			log.Error(err, "Failed to delete Pod", "Pod.Namespace", pod.Namespace, "Pod.Name", pod.Name)
+			return err
+		}
+	} else if !errors.IsNotFound(err) {
 		return err
 	}
 
-	// Apply the patch to the deployment
-	if err := r.Patch(ctx, deployment, patch); err != nil {
+	// Delete Service
+	service := &corev1.Service{}
+	serviceName := client.ObjectKey{Namespace: server.Namespace, Name: server.Name}
+	if err := r.Get(ctx, serviceName, service); err == nil {
+		if err = r.Delete(ctx, service); err != nil {
+			log.Error(err, "Failed to delete Service", "Service.Namespace", service.Namespace, "Service.Name", service.Name)
+			return err
+		}
+	} else if !errors.IsNotFound(err) {
+		return err
+	}
+
+	// Delete Ingress
+	ingress := &networkingv1.Ingress{}
+	ingressName := client.ObjectKey{Namespace: server.Namespace, Name: server.Name}
+	if err := r.Get(ctx, ingressName, ingress); err == nil {
+		if err = r.Delete(ctx, ingress); err != nil {
+			log.Error(err, "Failed to delete Ingress", "Ingress.Namespace", ingress.Namespace, "Ingress.Name", ingress.Name)
+			return err
+		}
+	} else if !errors.IsNotFound(err) {
 		return err
 	}
 
 	return nil
 }
 
-func updateNginxConfigMapAndService(
-	ctx context.Context,
-	r *ServerReconciler,
-	server *terrariav1.Server,
-	add bool,
-) error {
+// }
+
+func managePortAssignments(ctx context.Context, r *ServerReconciler, server *terrariav1.Server, add bool) error {
 	configMap := &corev1.ConfigMap{}
 	cmKey := client.ObjectKey{
-		Namespace: "ingress-nginx", // Assuming this is the namespace where Nginx is deployed
-		Name:      "tcp-services",
+		Namespace: "default", // Adjust as necessary
+		Name:      "port-assignments",
 	}
 
 	if err := r.Get(ctx, cmKey, configMap); err != nil {
-		return err
+		if errors.IsNotFound(err) {
+			// Create the ConfigMap if it does not exist
+			configMap = &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "port-assignments",
+					Namespace: "default",
+				},
+				Data: make(map[string]string),
+			}
+			if err := r.Create(ctx, configMap); err != nil {
+				return err
+			}
+		} else {
+			return err
+		}
 	}
 
-	servicePort := strconv.Itoa(server.Spec.Port) // Assuming server.Spec.Port is the desired port
-	nginxPort := servicePort                      // Define mapping logic if different
-	serviceName := fmt.Sprintf("%s/%s:80", server.Namespace, server.Name)
+	key := "server-" + server.Name
+
+	if configMap.Data == nil {
+		configMap.Data = make(map[string]string)
+	}
 
 	if add {
-		configMap.Data[nginxPort] = serviceName
+		configMap.Data[key] = strconv.Itoa(server.Spec.Port)
 	} else {
-		delete(configMap.Data, nginxPort)
+		delete(configMap.Data, key)
 	}
 
 	if err := r.Update(ctx, configMap); err != nil {
+		return err
+	}
+
+	// Ensure the NGINX tcp-services config map is updated accordingly
+	return updateNGINXConfigMap(ctx, r, server, add)
+}
+
+func updateNGINXConfigMap(ctx context.Context, r *ServerReconciler, server *terrariav1.Server, add bool) error {
+	nginxConfigMap := &corev1.ConfigMap{}
+	nginxCmKey := client.ObjectKey{
+		Namespace: "ingress-nginx", // Adjust as necessary
+		Name:      "tcp-services",
+	}
+
+	if err := r.Get(ctx, nginxCmKey, nginxConfigMap); err != nil {
+		if errors.IsNotFound(err) {
+			// Create the ConfigMap if it does not exist
+			nginxConfigMap = &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "tcp-services",
+					Namespace: "ingress-nginx",
+				},
+				Data: make(map[string]string),
+			}
+			if err := r.Create(ctx, nginxConfigMap); err != nil {
+				return err
+			}
+		} else {
+			return err
+		}
+	}
+
+	portKey := strconv.Itoa(server.Spec.Port)
+
+	if nginxConfigMap.Data == nil {
+		nginxConfigMap.Data = make(map[string]string)
+	}
+
+	if add {
+		nginxConfigMap.Data[portKey] = "default/" + server.Name + ":" + strconv.Itoa(server.Spec.Port)
+	} else {
+		delete(nginxConfigMap.Data, portKey)
+	}
+
+	if err := r.Update(ctx, nginxConfigMap); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func updateLoadBalancerService(ctx context.Context, r *ServerReconciler, server *terrariav1.Server, add bool) error {
+	lbService := &corev1.Service{}
+	lbKey := client.ObjectKey{
+		Namespace: "ingress-nginx", // Adjust as necessary
+		Name:      "ingress-nginx", // Adjust the LB service name as necessary
+	}
+
+	if err := r.Get(ctx, lbKey, lbService); err != nil {
+		return err
+	}
+
+	port := corev1.ServicePort{
+		Name:       "tcp-" + strconv.Itoa(server.Spec.Port),
+		Port:       int32(server.Spec.Port),
+		TargetPort: intstr.FromInt(server.Spec.Port),
+		Protocol:   corev1.ProtocolTCP,
+	}
+
+	// Find if port already exists
+	exists := false
+	for _, p := range lbService.Spec.Ports {
+		if p.Port == port.Port {
+			exists = true
+			break
+		}
+	}
+
+	if add {
+		if !exists {
+			lbService.Spec.Ports = append(lbService.Spec.Ports, port)
+		}
+	} else {
+		for i, p := range lbService.Spec.Ports {
+			if p.Port == port.Port {
+				lbService.Spec.Ports = append(lbService.Spec.Ports[:i], lbService.Spec.Ports[i+1:]...)
+				break
+			}
+		}
+	}
+
+	if err := r.Update(ctx, lbService); err != nil {
 		return err
 	}
 
