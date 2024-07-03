@@ -52,6 +52,11 @@ spec:
             type: object
           status:
             description: ServerStatus defines the observed state of Server
+            properties:
+              loadBalancerIP:
+                type: string
+              loadBalancerPort:
+                type: integer
             type: object
         type: object
     served: true

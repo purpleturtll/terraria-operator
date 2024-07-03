@@ -39,6 +39,10 @@ type ServerSpec struct {
 type ServerStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
+
+	LoadBalancerIP string `json:"loadBalancerIP,omitempty"`
+
+	LoadBalancerPort int `json:"loadBalancerPort,omitempty"`
 }
 
 //+kubebuilder:object:root=true

@@ -7,7 +7,7 @@ metadata:
     app.kubernetes.io/part-of: terraria-operator
     app.kubernetes.io/managed-by: kustomize
     app.kubernetes.io/created-by: terraria-operator
-  name: server-sample-2
+  name: server-sample-1
 spec:
   version: "1449"
   world: "moj swiat"

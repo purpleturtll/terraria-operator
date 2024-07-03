@@ -113,6 +113,11 @@ func (r *ServerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			log.Error(err, "Failed to update LoadBalancer service")
 			return ctrl.Result{Requeue: true}, err
 		}
+		// Update the Server CR with the LoadBalancer port if necessary
+		if err := updateServerStatusWithLoadBalancerPort(ctx, r, server); err != nil {
+			log.Error(err, "Failed to update Server status with LoadBalancer port")
+			return ctrl.Result{}, err
+		}
 		if err := managePortAssignments(ctx, r, server, true); err != nil {
 			log.Error(err, "Failed to manage port assignments")
 			return ctrl.Result{Requeue: true}, err
@@ -149,21 +154,6 @@ func reconcileResources(ctx context.Context, r *ServerReconciler, server *terrar
 			service = newServiceForCR(server)
 			if err = r.Create(ctx, service); err != nil {
 				log.Error(err, "Failed to create Service", "Service.Namespace", service.Namespace, "Service.Name", service.Name)
-				return err
-			}
-		} else {
-			return err
-		}
-	}
-
-	// Reconcile Ingress
-	ingress := &networkingv1.Ingress{}
-	ingressName := client.ObjectKey{Namespace: server.Namespace, Name: server.Name}
-	if err := r.Get(ctx, ingressName, ingress); err != nil {
-		if errors.IsNotFound(err) {
-			ingress = newIngressForCR(server)
-			if err = r.Create(ctx, ingress); err != nil {
-				log.Error(err, "Failed to create Ingress", "Ingress.Namespace", ingress.Namespace, "Ingress.Name", ingress.Name)
 				return err
 			}
 		} else {
@@ -216,8 +206,6 @@ func deleteResources(ctx context.Context, r *ServerReconciler, server *terrariav
 	return nil
 }
 
-// }
-
 func managePortAssignments(ctx context.Context, r *ServerReconciler, server *terrariav1.Server, add bool) error {
 	configMap := &corev1.ConfigMap{}
 	cmKey := client.ObjectKey{
@@ -252,7 +240,12 @@ func managePortAssignments(ctx context.Context, r *ServerReconciler, server *ter
 	if add {
 		configMap.Data[key] = strconv.Itoa(server.Spec.Port)
 	} else {
-		delete(configMap.Data, key)
+		if _, exists := configMap.Data[key]; exists {
+			delete(configMap.Data, key)
+			if err := r.Update(ctx, configMap); err != nil {
+				return err
+			}
+		}
 	}
 
 	if err := r.Update(ctx, configMap); err != nil {
@@ -354,6 +347,51 @@ func updateLoadBalancerService(ctx context.Context, r *ServerReconciler, server 
 	return nil
 }
 
+func updateServerStatusWithLoadBalancerPort(ctx context.Context, r *ServerReconciler, server *terrariav1.Server) error {
+	lbService := &corev1.Service{}
+	lbKey := client.ObjectKey{
+		Namespace: "ingress-nginx", // Adjust as necessary
+		Name:      "ingress-nginx", // Adjust the LB service name as necessary
+	}
+
+	if err := r.Get(ctx, lbKey, lbService); err != nil {
+		return err
+	}
+
+	// Extract the NodeIP
+	// Get some node IP from list nodes
+	nodeIP := &corev1.Node{}
+	nodeList := &corev1.NodeList{}
+	if err := r.List(ctx, nodeList); err != nil {
+		return err
+	}
+	if len(nodeList.Items) > 0 {
+		nodeIP = &nodeList.Items[0]
+	}
+
+	// Get Addresses where type is ExternalIP
+	for _, address := range nodeIP.Status.Addresses {
+		if address.Type == corev1.NodeExternalIP {
+			server.Status.LoadBalancerIP = address.Address
+			break
+		}
+	}
+
+	// Extract the NodePort for the LoadBalancer service
+	for _, port := range lbService.Spec.Ports {
+		if port.TargetPort.Type == intstr.Int && port.TargetPort.IntVal == int32(server.Spec.Port) {
+			server.Status.LoadBalancerPort = int(port.NodePort)
+			break
+		}
+	}
+
+	if err := r.Status().Update(ctx, server); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *ServerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
@@ -401,7 +439,7 @@ func newServiceForCR(cr *terrariav1.Server) *corev1.Service {
 			Ports: []corev1.ServicePort{
 				{
 					Protocol: corev1.ProtocolTCP,
-					Port:     80,
+					Port:     int32(cr.Spec.Port),
 					TargetPort: intstr.IntOrString{
 						Type:   intstr.Int,
 						IntVal: 7777,
@@ -412,47 +450,4 @@ func newServiceForCR(cr *terrariav1.Server) *corev1.Service {
 		},
 	}
 	return service
-}
-
-// newIngressForCR returns a Ingress with the same name/namespace as the cr
-func newIngressForCR(cr *terrariav1.Server) *networkingv1.Ingress {
-	ingress := &networkingv1.Ingress{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      cr.Name,
-			Namespace: cr.Namespace,
-			Annotations: map[string]string{
-				"kubernetes.io/ingress.class":                "nginx",
-				"nginx.ingress.kubernetes.io/rewrite-target": "/",
-			},
-		},
-		Spec: networkingv1.IngressSpec{
-			Rules: []networkingv1.IngressRule{
-				{
-					Host: cr.Name,
-					IngressRuleValue: networkingv1.IngressRuleValue{
-						HTTP: &networkingv1.HTTPIngressRuleValue{
-							Paths: []networkingv1.HTTPIngressPath{
-								{
-									Path: "/",
-									PathType: func() *networkingv1.PathType {
-										pt := networkingv1.PathTypePrefix
-										return &pt
-									}(),
-									Backend: networkingv1.IngressBackend{
-										Service: &networkingv1.IngressServiceBackend{
-											Name: cr.Name,
-											Port: networkingv1.ServiceBackendPort{
-												Number: 80,
-											},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-	return ingress
 }
